@@ -176,7 +176,7 @@ with st.sidebar:
         "What is the average rating per main category?",
         "Top 5 most discounted products",
         "Which category has the highest average price?",
-        "How many products have a rating above 4.5?",
+        "How many products have a rating above 4.3?",
         "What is the average discount percentage across all products?",
         "Show me products with more than 50,000 ratings",
     ]
