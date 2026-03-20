@@ -13,44 +13,72 @@ client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 DB_PATH = "amazon.db"
 
 # ── Page config ──────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Amazon KPI Chatbot", page_icon="📦", layout="wide")
-st.title("📦 Amazon KPI Chatbot")
-st.caption("Ask questions about the Amazon product dataset in plain English.")
+st.set_page_config(page_title="KPI Chatbot", page_icon="💬", layout="wide")
+st.title("💬 KPI Chatbot")
+st.caption("Ask questions about your dataset in plain English.")
 
-# ── Table schema (sent to Claude so it knows your data) ──────────────────────
-TABLE_SCHEMA = """
-Table name: products
+# ── Dynamically read schema from whatever DB is loaded ───────────────────────
+@st.cache_data
+def get_schema(db_path: str) -> str:
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
 
-Columns:
-  product_id          TEXT     - unique product identifier
-  product_name        TEXT     - full product name
-  category            TEXT     - full category path (pipe-separated)
-  main_category       TEXT     - top-level category (e.g. Electronics, Computers&Accessories)
-  discounted_price    REAL     - selling price in INR (₹)
-  actual_price        REAL     - original price before discount in INR (₹)
-  discount_percentage REAL     - discount as a number (e.g. 64 means 64%)
-  rating              REAL     - average rating out of 5
-  rating_count        INTEGER  - number of ratings
+    # Get all table names
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = [row[0] for row in cursor.fetchall()]
 
-Sample main_category values:
-  Electronics, Computers&Accessories, Home&Kitchen, OfficeProducts, 
-  MusicalInstruments, HealthPersonalCare, Toys&Games, Car&Motorbike
-"""
+    schema_parts = []
+    for table in tables:
+        # Get column info
+        cursor.execute(f"PRAGMA table_info({table})")
+        columns = cursor.fetchall()
 
-SYSTEM_PROMPT = f"""You are a data analyst assistant for an Amazon product dataset.
-Your job is to answer the user's question by writing a single SQLite SQL query.
+        # Get row count
+        cursor.execute(f"SELECT COUNT(*) FROM {table}")
+        row_count = cursor.fetchone()[0]
 
-{TABLE_SCHEMA}
+        # Get sample values for text columns (top 5 distinct)
+        col_details = []
+        for col in columns:
+            col_name = col[1]
+            col_type = col[2]
+            col_details.append(f"  {col_name:<25} {col_type}")
+
+            # For text columns, peek at distinct sample values
+            if col_type.upper() in ("TEXT", "VARCHAR", "CHAR", ""):
+                try:
+                    cursor.execute(
+                        f"SELECT DISTINCT {col_name} FROM {table} "
+                        f"WHERE {col_name} IS NOT NULL LIMIT 5"
+                    )
+                    samples = [str(r[0]) for r in cursor.fetchall()]
+                    if samples:
+                        col_details[-1] += f"   -- e.g. {', '.join(samples)}"
+                except Exception:
+                    pass
+
+        schema_parts.append(
+            f"Table: {table}  ({row_count:,} rows)\n" + "\n".join(col_details)
+        )
+
+    conn.close()
+    return "\n\n".join(schema_parts)
+
+
+def build_system_prompt(schema: str) -> str:
+    return f"""You are a data analyst assistant. Your job is to answer the user's \
+question by writing a single SQLite SQL query against the database described below.
+
+DATABASE SCHEMA:
+{schema}
 
 Rules:
 - Always respond with ONLY a valid SQLite SQL query. Nothing else.
-- Do not include markdown, backticks, or explanation — just the raw SQL.
-- Use main_category for category-level questions.
-- Prices are in INR (Indian Rupees).
+- Do not include markdown, backticks, or any explanation — just the raw SQL.
 - For top-N questions, use LIMIT N.
-- discount_percentage is already a number (64 = 64%), do not divide it.
-- rating_count may be NULL for some rows — use WHERE rating_count IS NOT NULL when relevant.
 - Always alias computed columns with a readable name (e.g. AVG(rating) AS avg_rating).
+- If a column might contain NULLs, filter them out when aggregating.
+- Infer column meaning from the schema samples above — do not assume anything not shown.
 """
 
 # ── Helper: run SQL and return a dataframe ───────────────────────────────────
@@ -63,12 +91,12 @@ def run_query(sql: str) -> pd.DataFrame:
     return df
 
 # ── Helper: ask Claude to generate SQL ──────────────────────────────────────
-def get_sql(question: str, history: list) -> str:
+def get_sql(question: str, history: list, system_prompt: str) -> str:
     messages = history + [{"role": "user", "content": question}]
     response = client.messages.create(
         model="claude-sonnet-4-5",
         max_tokens=500,
-        system=SYSTEM_PROMPT,
+        system=system_prompt,
         messages=messages,
     )
     return response.content[0].text.strip()
@@ -135,7 +163,11 @@ def render_chart(df: pd.DataFrame):
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "sql_history" not in st.session_state:
-    st.session_state.sql_history = []  # for multi-turn context
+    st.session_state.sql_history = []
+
+# Build system prompt once per session from live DB schema
+schema = get_schema(DB_PATH)
+SYSTEM_PROMPT = build_system_prompt(schema)
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -153,7 +185,17 @@ with st.sidebar:
             st.session_state["prefill"] = q
 
     st.divider()
-    st.caption("Dataset: Amazon India Products · 1,465 rows")
+    # Show live DB info instead of hardcoded caption
+    conn = sqlite3.connect(DB_PATH)
+    tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table'", conn)
+    for t in tables["name"]:
+        count = pd.read_sql(f"SELECT COUNT(*) AS n FROM {t}", conn)["n"][0]
+        st.caption(f"Table: `{t}` · {count:,} rows")
+    conn.close()
+
+    with st.expander("View schema"):
+        st.code(schema, language="sql")
+
     if st.button("Clear chat", use_container_width=True):
         st.session_state.messages = []
         st.session_state.sql_history = []
@@ -185,7 +227,7 @@ if user_input:
         with st.spinner("Thinking..."):
             try:
                 # Step 1: Generate SQL
-                sql = get_sql(user_input, st.session_state.sql_history)
+                sql = get_sql(user_input, st.session_state.sql_history, SYSTEM_PROMPT)
 
                 # Step 2: Run query
                 result_df = run_query(sql)
